@@ -495,20 +495,25 @@ async def create_donation(
 
     client_secret = None
 
+    # Helper to extract client_secret from a PaymentIntent (dict, object, or string ID)
+    def extract_from_pi(pi):
+        if not pi:
+            return None
+        if isinstance(pi, dict):
+            return pi.get('client_secret')
+        if isinstance(pi, stripe.PaymentIntent):
+            return pi.client_secret
+        if isinstance(pi, str) and pi.startswith('pi_'):
+            fetched = stripe.PaymentIntent.retrieve(pi)
+            return fetched.client_secret
+        return None
+
     # Method 1: Try expanded payment_intent object on the invoice
     try:
         pi = getattr(latest_invoice, 'payment_intent', None)
-        if pi:
-            if isinstance(pi, dict):
-                client_secret = pi.get('client_secret')
-            elif isinstance(pi, stripe.PaymentIntent):
-                client_secret = pi.client_secret
-            elif isinstance(pi, str) and pi.startswith('pi_'):
-                # It's just an ID string — fetch the PaymentIntent
-                fetched_pi = stripe.PaymentIntent.retrieve(pi)
-                client_secret = fetched_pi.client_secret
-    except Exception:
-        pass
+        client_secret = extract_from_pi(pi)
+    except Exception as e:
+        logger.warning(f"Method 1 failed: {e}")
 
     # Method 2: If still no client_secret, refresh invoice with expansion
     if not client_secret:
@@ -520,12 +525,9 @@ async def create_donation(
                     expand=['payment_intent']
                 )
                 pi = getattr(refreshed, 'payment_intent', None)
-                if isinstance(pi, dict):
-                    client_secret = pi.get('client_secret')
-                elif isinstance(pi, stripe.PaymentIntent):
-                    client_secret = pi.client_secret
+                client_secret = extract_from_pi(pi)
         except Exception as e:
-            logger.error(f"Fallback invoice retrieval failed: {e}")
+            logger.error(f"Method 2 failed: {e}")
 
     # Method 3: Ultimate fallback - get from subscription's pending_setup_intent
     if not client_secret:
@@ -536,8 +538,11 @@ async def create_donation(
                     client_secret = psi.get('client_secret')
                 elif isinstance(psi, stripe.SetupIntent):
                     client_secret = psi.client_secret
-        except Exception:
-            pass
+                elif isinstance(psi, str) and psi.startswith('seti_'):
+                    fetched = stripe.SetupIntent.retrieve(psi)
+                    client_secret = fetched.client_secret
+        except Exception as e:
+            logger.error(f"Method 3 failed: {e}")
 
     if not client_secret:
         logger.error("Could not extract client_secret from subscription")
