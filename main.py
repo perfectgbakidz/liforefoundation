@@ -386,7 +386,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "https://lifora-foundation.vercel.app",
+        "https://yourfrontend.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -495,50 +495,45 @@ async def create_donation(
 
     client_secret = None
 
-    # Method 1: Try expanded payment_intent object
+    # Method 1: Try expanded payment_intent object on the invoice
     try:
-        pi = latest_invoice.get("payment_intent")
-        if pi and isinstance(pi, dict):
-            client_secret = pi.get("client_secret")
-        elif pi and isinstance(pi, stripe.PaymentIntent):
-            client_secret = pi.client_secret
+        pi = getattr(latest_invoice, 'payment_intent', None)
+        if pi:
+            if isinstance(pi, dict):
+                client_secret = pi.get('client_secret')
+            elif isinstance(pi, stripe.PaymentIntent):
+                client_secret = pi.client_secret
+            elif isinstance(pi, str) and pi.startswith('pi_'):
+                # It's just an ID string — fetch the PaymentIntent
+                fetched_pi = stripe.PaymentIntent.retrieve(pi)
+                client_secret = fetched_pi.client_secret
     except Exception:
         pass
 
-    # Method 2: If payment_intent is just an ID string, fetch it
+    # Method 2: If still no client_secret, refresh invoice with expansion
     if not client_secret:
         try:
-            pi_id = latest_invoice.get("payment_intent")
-            if isinstance(pi_id, str) and pi_id.startswith("pi_"):
-                fetched_pi = stripe.PaymentIntent.retrieve(pi_id)
-                client_secret = fetched_pi.client_secret
-        except Exception:
-            pass
-
-    # Method 3: Fallback - refresh invoice with payment_intent expanded
-    if not client_secret:
-        try:
-            invoice_id = latest_invoice.get("id")
+            invoice_id = getattr(latest_invoice, 'id', None)
             if invoice_id:
                 refreshed = stripe.Invoice.retrieve(
                     invoice_id,
-                    expand=["payment_intent"]
+                    expand=['payment_intent']
                 )
-                pi = refreshed.get("payment_intent")
+                pi = getattr(refreshed, 'payment_intent', None)
                 if isinstance(pi, dict):
-                    client_secret = pi.get("client_secret")
+                    client_secret = pi.get('client_secret')
                 elif isinstance(pi, stripe.PaymentIntent):
                     client_secret = pi.client_secret
         except Exception as e:
             logger.error(f"Fallback invoice retrieval failed: {e}")
 
-    # Method 4: Ultimate fallback - get from subscription's pending_setup_intent
+    # Method 3: Ultimate fallback - get from subscription's pending_setup_intent
     if not client_secret:
         try:
-            psi = subscription.get("pending_setup_intent")
+            psi = getattr(subscription, 'pending_setup_intent', None)
             if psi:
                 if isinstance(psi, dict):
-                    client_secret = psi.get("client_secret")
+                    client_secret = psi.get('client_secret')
                 elif isinstance(psi, stripe.SetupIntent):
                     client_secret = psi.client_secret
         except Exception:
