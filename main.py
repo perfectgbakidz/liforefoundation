@@ -1,12 +1,16 @@
 """
 Production-ready FastAPI backend for Stripe donations.
 Updated for Stripe 2025 API changes.
-Supports:
-- One-time payments
+
+Features:
+- One-time donations
 - Monthly subscriptions
 - Yearly subscriptions
-- Stripe webhooks
-- Proper subscription client_secret handling
+- Stripe webhook handling
+- Stripe 2025 subscription confirmation_secret support
+- Reusable recurring prices
+- Better logging
+- Render-ready deployment
 """
 
 import os
@@ -16,42 +20,59 @@ from typing import Literal
 
 import stripe
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException, status
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, EmailStr, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    EmailStr,
+    field_validator,
+)
 
 # ─────────────────────────────────────────────────────────────
-# Load Environment Variables
+# ENVIRONMENT
 # ─────────────────────────────────────────────────────────────
 
 load_dotenv()
 
-# ─────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+STRIPE_SECRET_KEY = os.getenv(
+    "STRIPE_SECRET_KEY",
+    "",
 )
 
-logger = logging.getLogger("donation_api")
-
-# ─────────────────────────────────────────────────────────────
-# Stripe Configuration
-# ─────────────────────────────────────────────────────────────
-
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_WEBHOOK_SECRET = os.getenv(
+    "STRIPE_WEBHOOK_SECRET",
+    "",
+)
 
 if not STRIPE_SECRET_KEY:
-    raise RuntimeError("STRIPE_SECRET_KEY is missing")
+    raise RuntimeError(
+        "Missing STRIPE_SECRET_KEY"
+    )
 
 stripe.api_key = STRIPE_SECRET_KEY
 
 # ─────────────────────────────────────────────────────────────
-# Exchange Rates
+# LOGGING
+# ─────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
+)
+
+logger = logging.getLogger(
+    "donation_api"
+)
+
+# ─────────────────────────────────────────────────────────────
+# EXCHANGE RATES
 # ─────────────────────────────────────────────────────────────
 
 EXCHANGE_RATES = {
@@ -62,13 +83,14 @@ EXCHANGE_RATES = {
 }
 
 # ─────────────────────────────────────────────────────────────
-# Cache
+# CACHE
 # ─────────────────────────────────────────────────────────────
 
 _product_cache: dict[str, str] = {}
+_price_cache: dict[str, str] = {}
 
 # ─────────────────────────────────────────────────────────────
-# Pydantic Models
+# PYDANTIC MODELS
 # ─────────────────────────────────────────────────────────────
 
 class ExchangeRateResponse(BaseModel):
@@ -76,28 +98,57 @@ class ExchangeRateResponse(BaseModel):
 
 
 class DonationRequest(BaseModel):
-    amount: int = Field(..., ge=100)
-    frequency: Literal["One Time", "Monthly", "Yearly"]
-    currency: str = Field(..., min_length=3, max_length=3)
 
-    firstName: str = Field(..., min_length=1, max_length=100)
-    lastName: str = Field(..., min_length=1, max_length=100)
+    amount: int = Field(
+        ...,
+        ge=100,
+    )
+
+    frequency: Literal[
+        "One Time",
+        "Monthly",
+        "Yearly",
+    ]
+
+    currency: str = Field(
+        ...,
+        min_length=3,
+        max_length=3,
+    )
+
+    firstName: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+    )
+
+    lastName: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+    )
 
     email: EmailStr
 
     @field_validator("currency")
     @classmethod
-    def validate_currency(cls, value: str) -> str:
+    def validate_currency(
+        cls,
+        value: str,
+    ) -> str:
         return value.upper()
 
 
 class DonationResponse(BaseModel):
     clientSecret: str
-    type: Literal["payment_intent", "subscription"]
+    type: Literal[
+        "payment_intent",
+        "subscription",
+    ]
 
 
 # ─────────────────────────────────────────────────────────────
-# Stripe Helpers
+# HELPERS
 # ─────────────────────────────────────────────────────────────
 
 async def get_or_create_customer(
@@ -105,20 +156,21 @@ async def get_or_create_customer(
     first_name: str,
     last_name: str,
 ) -> stripe.Customer:
-    """
-    Get existing customer or create new one.
-    """
 
     try:
+
         customers = stripe.Customer.search(
             query=f"email:'{email}'",
             limit=1,
         )
 
         if customers.data:
+
             customer = customers.data[0]
 
-            logger.info(f"Found existing customer: {customer.id}")
+            logger.info(
+                f"Using customer: {customer.id}"
+            )
 
             return customer
 
@@ -131,23 +183,28 @@ async def get_or_create_customer(
             },
         )
 
-        logger.info(f"Created new customer: {customer.id}")
+        logger.info(
+            f"Created customer: {customer.id}"
+        )
 
         return customer
 
     except stripe.error.StripeError as exc:
-        logger.exception("Customer creation failed")
+
+        logger.exception(
+            "Customer error"
+        )
 
         raise HTTPException(
             status_code=502,
-            detail=exc.user_message or str(exc),
+            detail=(
+                exc.user_message
+                or str(exc)
+            ),
         )
 
 
 async def get_or_create_donation_product() -> str:
-    """
-    Retrieve or create donation product.
-    """
 
     cache_key = "donation_product"
 
@@ -155,54 +212,121 @@ async def get_or_create_donation_product() -> str:
         return _product_cache[cache_key]
 
     try:
+
         products = stripe.Product.search(
-            query="name:'Donation' AND active:'true'",
+            query=(
+                "name:'Donation' "
+                "AND active:'true'"
+            ),
             limit=1,
         )
 
         if products.data:
+
             product_id = products.data[0].id
 
-            _product_cache[cache_key] = product_id
+            _product_cache[
+                cache_key
+            ] = product_id
 
-            logger.info(f"Using existing product: {product_id}")
+            logger.info(
+                f"Using product: {product_id}"
+            )
 
             return product_id
 
         product = stripe.Product.create(
             name="Donation",
-            description="Recurring donation",
+            description=(
+                "Donation product"
+            ),
             metadata={
                 "category": "donation",
             },
         )
 
-        _product_cache[cache_key] = product.id
+        _product_cache[
+            cache_key
+        ] = product.id
 
-        logger.info(f"Created product: {product.id}")
+        logger.info(
+            f"Created product: {product.id}"
+        )
 
         return product.id
 
     except stripe.error.StripeError as exc:
-        logger.exception("Product creation failed")
+
+        logger.exception(
+            "Product error"
+        )
 
         raise HTTPException(
             status_code=502,
-            detail=exc.user_message or str(exc),
+            detail=(
+                exc.user_message
+                or str(exc)
+            ),
         )
 
 
-async def create_recurring_price(
+async def get_or_create_price(
     product_id: str,
     amount: int,
     currency: str,
-    interval: Literal["month", "year"],
-) -> stripe.Price:
-    """
-    Create recurring Stripe price.
-    """
+    interval: Literal[
+        "month",
+        "year",
+    ],
+) -> str:
+
+    cache_key = (
+        f"{amount}_"
+        f"{currency}_"
+        f"{interval}"
+    )
+
+    if cache_key in _price_cache:
+        return _price_cache[
+            cache_key
+        ]
 
     try:
+
+        prices = stripe.Price.search(
+            query=(
+                f"active:'true' "
+                f"AND currency:'{currency.lower()}' "
+                f"AND unit_amount:{amount}"
+            ),
+            limit=100,
+        )
+
+        for price in prices.data:
+
+            recurring = getattr(
+                price,
+                "recurring",
+                None,
+            )
+
+            if (
+                recurring
+                and recurring.get(
+                    "interval"
+                ) == interval
+            ):
+
+                _price_cache[
+                    cache_key
+                ] = price.id
+
+                logger.info(
+                    f"Using price: {price.id}"
+                )
+
+                return price.id
+
         price = stripe.Price.create(
             product=product_id,
             unit_amount=amount,
@@ -215,16 +339,28 @@ async def create_recurring_price(
             },
         )
 
-        logger.info(f"Created recurring price: {price.id}")
+        _price_cache[
+            cache_key
+        ] = price.id
 
-        return price
+        logger.info(
+            f"Created price: {price.id}"
+        )
+
+        return price.id
 
     except stripe.error.StripeError as exc:
-        logger.exception("Price creation failed")
+
+        logger.exception(
+            "Price error"
+        )
 
         raise HTTPException(
             status_code=502,
-            detail=exc.user_message or str(exc),
+            detail=(
+                exc.user_message
+                or str(exc)
+            ),
         )
 
 
@@ -233,11 +369,9 @@ async def create_one_time_payment(
     currency: str,
     customer_id: str,
 ) -> stripe.PaymentIntent:
-    """
-    Create one-time payment intent.
-    """
 
     try:
+
         intent = stripe.PaymentIntent.create(
             amount=amount,
             currency=currency.lower(),
@@ -246,20 +380,31 @@ async def create_one_time_payment(
                 "enabled": True,
             },
             metadata={
-                "donation_type": "one_time",
+                "donation_type": (
+                    "one_time"
+                ),
             },
         )
 
-        logger.info(f"Created payment intent: {intent.id}")
+        logger.info(
+            f"Created payment intent: "
+            f"{intent.id}"
+        )
 
         return intent
 
     except stripe.error.StripeError as exc:
-        logger.exception("PaymentIntent creation failed")
+
+        logger.exception(
+            "PaymentIntent error"
+        )
 
         raise HTTPException(
             status_code=502,
-            detail=exc.user_message or str(exc),
+            detail=(
+                exc.user_message
+                or str(exc)
+            ),
         )
 
 
@@ -267,114 +412,342 @@ async def create_subscription(
     customer_id: str,
     price_id: str,
 ) -> stripe.Subscription:
-    """
-    Create Stripe subscription.
-    Updated for Stripe 2025 API.
-    """
 
     try:
-        subscription = stripe.Subscription.create(
-            customer=customer_id,
-            items=[
-                {
-                    "price": price_id,
-                }
-            ],
-            payment_behavior="default_incomplete",
-            payment_settings={
-                "save_default_payment_method": "on_subscription",
-            },
-            expand=[
-                "latest_invoice.payment_intent",
-            ],
-            metadata={
-                "donation_type": "recurring",
-            },
+
+        subscription = (
+            stripe.Subscription.create(
+                customer=customer_id,
+                items=[
+                    {
+                        "price": price_id,
+                    }
+                ],
+                payment_behavior=(
+                    "allow_incomplete"
+                ),
+                payment_settings={
+                    "save_default_payment_method":
+                    "on_subscription",
+                },
+                expand=[
+                    (
+                        "latest_invoice."
+                        "confirmation_secret"
+                    ),
+                    (
+                        "latest_invoice."
+                        "payment_intent"
+                    ),
+                    (
+                        "pending_setup_intent"
+                    ),
+                ],
+                metadata={
+                    "donation_type":
+                    "recurring",
+                },
+            )
         )
 
-        logger.info(f"Created subscription: {subscription.id}")
+        logger.info(
+            f"Created subscription: "
+            f"{subscription.id}"
+        )
 
         return subscription
 
     except stripe.error.StripeError as exc:
-        logger.exception("Subscription creation failed")
+
+        logger.exception(
+            "Subscription error"
+        )
 
         raise HTTPException(
             status_code=502,
-            detail=exc.user_message or str(exc),
+            detail=(
+                exc.user_message
+                or str(exc)
+            ),
         )
 
 
 # ─────────────────────────────────────────────────────────────
-# Webhook Handlers
+# CLIENT SECRET EXTRACTION
+# ─────────────────────────────────────────────────────────────
+
+async def extract_client_secret(
+    subscription: stripe.Subscription,
+) -> str:
+
+    latest_invoice = getattr(
+        subscription,
+        "latest_invoice",
+        None,
+    )
+
+    client_secret = None
+
+    # ─────────────────────────────────────────
+    # confirmation_secret
+    # ─────────────────────────────────────────
+
+    try:
+
+        if latest_invoice:
+
+            confirmation_secret = getattr(
+                latest_invoice,
+                "confirmation_secret",
+                None,
+            )
+
+            if confirmation_secret:
+
+                if isinstance(
+                    confirmation_secret,
+                    dict,
+                ):
+
+                    client_secret = (
+                        confirmation_secret.get(
+                            "client_secret"
+                        )
+                    )
+
+                else:
+
+                    client_secret = getattr(
+                        confirmation_secret,
+                        "client_secret",
+                        None,
+                    )
+
+    except Exception as e:
+
+        logger.error(
+            f"confirmation_secret "
+            f"error: {e}"
+        )
+
+    # ─────────────────────────────────────────
+    # payment_intent fallback
+    # ─────────────────────────────────────────
+
+    if not client_secret:
+
+        try:
+
+            if latest_invoice:
+
+                payment_intent = getattr(
+                    latest_invoice,
+                    "payment_intent",
+                    None,
+                )
+
+                if payment_intent:
+
+                    if isinstance(
+                        payment_intent,
+                        str,
+                    ):
+
+                        payment_intent = (
+                            stripe.PaymentIntent.retrieve(
+                                payment_intent
+                            )
+                        )
+
+                    if isinstance(
+                        payment_intent,
+                        dict,
+                    ):
+
+                        client_secret = (
+                            payment_intent.get(
+                                "client_secret"
+                            )
+                        )
+
+                    else:
+
+                        client_secret = getattr(
+                            payment_intent,
+                            "client_secret",
+                            None,
+                        )
+
+        except Exception as e:
+
+            logger.error(
+                f"payment_intent "
+                f"error: {e}"
+            )
+
+    # ─────────────────────────────────────────
+    # setup_intent fallback
+    # ─────────────────────────────────────────
+
+    if not client_secret:
+
+        try:
+
+            setup_intent = getattr(
+                subscription,
+                "pending_setup_intent",
+                None,
+            )
+
+            if setup_intent:
+
+                if isinstance(
+                    setup_intent,
+                    str,
+                ):
+
+                    setup_intent = (
+                        stripe.SetupIntent.retrieve(
+                            setup_intent
+                        )
+                    )
+
+                if isinstance(
+                    setup_intent,
+                    dict,
+                ):
+
+                    client_secret = (
+                        setup_intent.get(
+                            "client_secret"
+                        )
+                    )
+
+                else:
+
+                    client_secret = getattr(
+                        setup_intent,
+                        "client_secret",
+                        None,
+                    )
+
+        except Exception as e:
+
+            logger.error(
+                f"setup_intent "
+                f"error: {e}"
+            )
+
+    # ─────────────────────────────────────────
+
+    if not client_secret:
+
+        logger.error(
+            f"""
+            Failed to extract client_secret
+
+            Subscription:
+            {subscription}
+
+            Invoice:
+            {latest_invoice}
+            """
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to initialize "
+                "Stripe payment"
+            ),
+        )
+
+    return client_secret
+
+
+# ─────────────────────────────────────────────────────────────
+# WEBHOOK HANDLERS
 # ─────────────────────────────────────────────────────────────
 
 async def handle_payment_intent_succeeded(
-    payment_intent: stripe.PaymentIntent,
+    payment_intent,
 ):
     logger.info(
-        f"Payment succeeded: {payment_intent.id}"
+        f"Payment succeeded: "
+        f"{payment_intent.id}"
     )
 
 
 async def handle_payment_intent_failed(
-    payment_intent: stripe.PaymentIntent,
+    payment_intent,
 ):
     logger.warning(
-        f"Payment failed: {payment_intent.id}"
+        f"Payment failed: "
+        f"{payment_intent.id}"
     )
 
 
 async def handle_invoice_payment_succeeded(
-    invoice: stripe.Invoice,
+    invoice,
 ):
     logger.info(
-        f"Invoice paid: {invoice.id}"
+        f"Invoice paid: "
+        f"{invoice.id}"
     )
 
 
 async def handle_invoice_payment_failed(
-    invoice: stripe.Invoice,
+    invoice,
 ):
     logger.warning(
-        f"Invoice failed: {invoice.id}"
+        f"Invoice failed: "
+        f"{invoice.id}"
     )
 
 
 async def handle_subscription_updated(
-    subscription: stripe.Subscription,
+    subscription,
 ):
     logger.info(
-        f"Subscription updated: {subscription.id}"
+        f"Subscription updated: "
+        f"{subscription.id}"
     )
 
 
 async def handle_subscription_deleted(
-    subscription: stripe.Subscription,
+    subscription,
 ):
     logger.info(
-        f"Subscription deleted: {subscription.id}"
+        f"Subscription deleted: "
+        f"{subscription.id}"
     )
 
 
 # ─────────────────────────────────────────────────────────────
-# FastAPI Lifespan
+# LIFESPAN
 # ─────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Donation API starting")
+
+    logger.info(
+        "🚀 Donation API starting"
+    )
+
     yield
-    logger.info("🛑 Donation API shutting down")
+
+    logger.info(
+        "🛑 Donation API shutting down"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
-# FastAPI App
+# FASTAPI
 # ─────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Stripe Donation API",
-    version="2.1.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -386,7 +759,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "https://yourfrontend.com",
+        "https://lifora-foundation.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -394,30 +767,42 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────────────────────────
-# Routes
+# ROUTES
 # ─────────────────────────────────────────────────────────────
 
-@app.get("/")
+@app.api_route(
+    "/",
+    methods=["GET", "HEAD"],
+)
 async def root():
+
     return {
-        "message": "Donation API running",
+        "message":
+        "Donation API running",
     }
 
 
 @app.get("/health")
 async def health():
+
     return {
         "status": "healthy",
-        "stripe": bool(STRIPE_SECRET_KEY),
-        "webhook": bool(STRIPE_WEBHOOK_SECRET),
+        "stripe":
+        bool(STRIPE_SECRET_KEY),
+        "webhook":
+        bool(
+            STRIPE_WEBHOOK_SECRET
+        ),
     }
 
 
 @app.get(
     "/api/exchange-rate",
-    response_model=ExchangeRateResponse,
+    response_model=
+    ExchangeRateResponse,
 )
 async def exchange_rates():
+
     return ExchangeRateResponse(
         rates=EXCHANGE_RATES
     )
@@ -425,227 +810,233 @@ async def exchange_rates():
 
 @app.post(
     "/api/donate",
-    response_model=DonationResponse,
+    response_model=
+    DonationResponse,
 )
 async def create_donation(
     payload: DonationRequest,
 ):
-    """
-    Create donation payment or subscription.
-    """
 
-    customer = await get_or_create_customer(
-        email=payload.email,
-        first_name=payload.firstName,
-        last_name=payload.lastName,
+    customer = (
+        await get_or_create_customer(
+            email=payload.email,
+            first_name=
+            payload.firstName,
+            last_name=
+            payload.lastName,
+        )
     )
 
     # ─────────────────────────────────────────
-    # One-time payment
+    # ONE TIME
     # ─────────────────────────────────────────
 
-    if payload.frequency == "One Time":
+    if payload.frequency == (
+        "One Time"
+    ):
 
-        payment_intent = await create_one_time_payment(
-            amount=payload.amount,
-            currency=payload.currency,
-            customer_id=customer.id,
+        payment_intent = (
+            await create_one_time_payment(
+                amount=payload.amount,
+                currency=
+                payload.currency,
+                customer_id=
+                customer.id,
+            )
         )
 
         return DonationResponse(
-            clientSecret=payment_intent.client_secret,
-            type="payment_intent",
+            clientSecret=
+            payment_intent.client_secret,
+            type=
+            "payment_intent",
         )
 
     # ─────────────────────────────────────────
-    # Subscription
+    # SUBSCRIPTION
     # ─────────────────────────────────────────
 
     interval = (
         "month"
-        if payload.frequency == "Monthly"
+        if payload.frequency
+        == "Monthly"
         else "year"
     )
 
-    product_id = await get_or_create_donation_product()
-
-    price = await create_recurring_price(
-        product_id=product_id,
-        amount=payload.amount,
-        currency=payload.currency,
-        interval=interval,
+    product_id = (
+        await get_or_create_donation_product()
     )
 
-    subscription = await create_subscription(
-        customer_id=customer.id,
-        price_id=price.id,
+    price_id = (
+        await get_or_create_price(
+            product_id=
+            product_id,
+            amount=
+            payload.amount,
+            currency=
+            payload.currency,
+            interval=
+            interval,
+        )
     )
 
-    latest_invoice = subscription.latest_invoice
-
-    if not latest_invoice:
-        raise HTTPException(
-            status_code=500,
-            detail="No latest invoice found",
+    subscription = (
+        await create_subscription(
+            customer_id=
+            customer.id,
+            price_id=
+            price_id,
         )
+    )
 
-    # ─────────────────────────────────────────
-    # Extract client_secret - Stripe 2025 API
-    # ─────────────────────────────────────────
-
-    client_secret = None
-
-    # Helper to extract client_secret from a PaymentIntent (dict, object, or string ID)
-    def extract_from_pi(pi):
-        if not pi:
-            return None
-        if isinstance(pi, dict):
-            return pi.get('client_secret')
-        if isinstance(pi, stripe.PaymentIntent):
-            return pi.client_secret
-        if isinstance(pi, str) and pi.startswith('pi_'):
-            fetched = stripe.PaymentIntent.retrieve(pi)
-            return fetched.client_secret
-        return None
-
-    # Method 1: Try expanded payment_intent object on the invoice
-    try:
-        pi = getattr(latest_invoice, 'payment_intent', None)
-        client_secret = extract_from_pi(pi)
-    except Exception as e:
-        logger.warning(f"Method 1 failed: {e}")
-
-    # Method 2: If still no client_secret, refresh invoice with expansion
-    if not client_secret:
-        try:
-            invoice_id = getattr(latest_invoice, 'id', None)
-            if invoice_id:
-                refreshed = stripe.Invoice.retrieve(
-                    invoice_id,
-                    expand=['payment_intent']
-                )
-                pi = getattr(refreshed, 'payment_intent', None)
-                client_secret = extract_from_pi(pi)
-        except Exception as e:
-            logger.error(f"Method 2 failed: {e}")
-
-    # Method 3: Ultimate fallback - get from subscription's pending_setup_intent
-    if not client_secret:
-        try:
-            psi = getattr(subscription, 'pending_setup_intent', None)
-            if psi:
-                if isinstance(psi, dict):
-                    client_secret = psi.get('client_secret')
-                elif isinstance(psi, stripe.SetupIntent):
-                    client_secret = psi.client_secret
-                elif isinstance(psi, str) and psi.startswith('seti_'):
-                    fetched = stripe.SetupIntent.retrieve(psi)
-                    client_secret = fetched.client_secret
-        except Exception as e:
-            logger.error(f"Method 3 failed: {e}")
-
-    if not client_secret:
-        logger.error("Could not extract client_secret from subscription")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to initialize payment. Please try again.",
+    client_secret = (
+        await extract_client_secret(
+            subscription
         )
+    )
 
     return DonationResponse(
-        clientSecret=client_secret,
+        clientSecret=
+        client_secret,
         type="subscription",
     )
 
 
 # ─────────────────────────────────────────────────────────────
-# Stripe Webhook
+# WEBHOOK
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/api/webhook")
 async def stripe_webhook(
     request: Request,
 ):
-    """
-    Stripe webhook endpoint.
-    """
 
-    payload = await request.body()
+    payload = (
+        await request.body()
+    )
 
     signature = request.headers.get(
         "stripe-signature"
     )
 
     if not signature:
+
         raise HTTPException(
             status_code=400,
-            detail="Missing Stripe signature",
+            detail=(
+                "Missing Stripe "
+                "signature"
+            ),
         )
 
     try:
-        event = stripe.Webhook.construct_event(
-            payload,
-            signature,
-            STRIPE_WEBHOOK_SECRET,
+
+        event = (
+            stripe.Webhook.construct_event(
+                payload,
+                signature,
+                STRIPE_WEBHOOK_SECRET,
+            )
         )
 
     except ValueError:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid payload",
         )
 
     except stripe.error.SignatureVerificationError:
+
         raise HTTPException(
             status_code=401,
-            detail="Invalid Stripe signature",
+            detail=(
+                "Invalid Stripe "
+                "signature"
+            ),
         )
 
     logger.info(
-        f"Webhook received: {event.type}"
+        f"Webhook received: "
+        f"{event.type}"
     )
 
     try:
 
         match event.type:
 
-            case "payment_intent.succeeded":
-                await handle_payment_intent_succeeded(
-                    event.data.object
+            case (
+                "payment_intent.succeeded"
+            ):
+
+                await (
+                    handle_payment_intent_succeeded(
+                        event.data.object
+                    )
                 )
 
-            case "payment_intent.payment_failed":
-                await handle_payment_intent_failed(
-                    event.data.object
+            case (
+                "payment_intent.payment_failed"
+            ):
+
+                await (
+                    handle_payment_intent_failed(
+                        event.data.object
+                    )
                 )
 
-            case "invoice.payment_succeeded":
-                await handle_invoice_payment_succeeded(
-                    event.data.object
+            case (
+                "invoice.payment_succeeded"
+            ):
+
+                await (
+                    handle_invoice_payment_succeeded(
+                        event.data.object
+                    )
                 )
 
-            case "invoice.payment_failed":
-                await handle_invoice_payment_failed(
-                    event.data.object
+            case (
+                "invoice.payment_failed"
+            ):
+
+                await (
+                    handle_invoice_payment_failed(
+                        event.data.object
+                    )
                 )
 
-            case "customer.subscription.updated":
-                await handle_subscription_updated(
-                    event.data.object
+            case (
+                "customer.subscription.updated"
+            ):
+
+                await (
+                    handle_subscription_updated(
+                        event.data.object
+                    )
                 )
 
-            case "customer.subscription.deleted":
-                await handle_subscription_deleted(
-                    event.data.object
+            case (
+                "customer.subscription.deleted"
+            ):
+
+                await (
+                    handle_subscription_deleted(
+                        event.data.object
+                    )
                 )
 
             case _:
+
                 logger.info(
-                    f"Unhandled event: {event.type}"
+                    f"Unhandled event: "
+                    f"{event.type}"
                 )
 
     except Exception as exc:
+
         logger.exception(
-            f"Webhook processing failed: {exc}"
+            f"Webhook processing "
+            f"failed: {exc}"
         )
 
     return JSONResponse(
@@ -656,7 +1047,7 @@ async def stripe_webhook(
     )
 
 # ─────────────────────────────────────────────────────────────
-# Main
+# MAIN
 # ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -666,6 +1057,11 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
+        port=int(
+            os.getenv(
+                "PORT",
+                "8000",
+            )
+        ),
         reload=False,
     )
