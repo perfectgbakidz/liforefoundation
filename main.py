@@ -6,7 +6,7 @@ Supports:
 - Monthly subscriptions
 - Yearly subscriptions
 - Stripe webhooks
-- Proper subscription confirmation_secret handling
+- Proper subscription client_secret handling
 """
 
 import os
@@ -269,7 +269,7 @@ async def create_subscription(
 ) -> stripe.Subscription:
     """
     Create Stripe subscription.
-    Stripe 2025 compatible.
+    Updated for Stripe 2025 API.
     """
 
     try:
@@ -285,28 +285,25 @@ async def create_subscription(
                 "save_default_payment_method": "on_subscription",
             },
             expand=[
-                "latest_invoice",
+                "latest_invoice.payment_intent",
             ],
             metadata={
                 "donation_type": "recurring",
             },
         )
 
-        logger.info(
-            f"Created subscription: {subscription.id}"
-        )
+        logger.info(f"Created subscription: {subscription.id}")
 
         return subscription
 
     except stripe.error.StripeError as exc:
-        logger.exception(
-            "Subscription creation failed"
-        )
+        logger.exception("Subscription creation failed")
 
         raise HTTPException(
             status_code=502,
             detail=exc.user_message or str(exc),
         )
+
 
 # ─────────────────────────────────────────────────────────────
 # Webhook Handlers
@@ -377,7 +374,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Stripe Donation API",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -484,86 +481,81 @@ async def create_donation(
         price_id=price.id,
     )
 
-latest_invoice = subscription.latest_invoice
+    latest_invoice = subscription.latest_invoice
 
-if not latest_invoice:
-    raise HTTPException(
-        status_code=500,
-        detail="No latest invoice found",
+    if not latest_invoice:
+        raise HTTPException(
+            status_code=500,
+            detail="No latest invoice found",
+        )
+
+    # ─────────────────────────────────────────
+    # Extract client_secret - Stripe 2025 API
+    # ─────────────────────────────────────────
+
+    client_secret = None
+
+    # Method 1: Try expanded payment_intent object
+    try:
+        pi = latest_invoice.get("payment_intent")
+        if pi and isinstance(pi, dict):
+            client_secret = pi.get("client_secret")
+        elif pi and isinstance(pi, stripe.PaymentIntent):
+            client_secret = pi.client_secret
+    except Exception:
+        pass
+
+    # Method 2: If payment_intent is just an ID string, fetch it
+    if not client_secret:
+        try:
+            pi_id = latest_invoice.get("payment_intent")
+            if isinstance(pi_id, str) and pi_id.startswith("pi_"):
+                fetched_pi = stripe.PaymentIntent.retrieve(pi_id)
+                client_secret = fetched_pi.client_secret
+        except Exception:
+            pass
+
+    # Method 3: Fallback - refresh invoice with payment_intent expanded
+    if not client_secret:
+        try:
+            invoice_id = latest_invoice.get("id")
+            if invoice_id:
+                refreshed = stripe.Invoice.retrieve(
+                    invoice_id,
+                    expand=["payment_intent"]
+                )
+                pi = refreshed.get("payment_intent")
+                if isinstance(pi, dict):
+                    client_secret = pi.get("client_secret")
+                elif isinstance(pi, stripe.PaymentIntent):
+                    client_secret = pi.client_secret
+        except Exception as e:
+            logger.error(f"Fallback invoice retrieval failed: {e}")
+
+    # Method 4: Ultimate fallback - get from subscription's pending_setup_intent
+    if not client_secret:
+        try:
+            psi = subscription.get("pending_setup_intent")
+            if psi:
+                if isinstance(psi, dict):
+                    client_secret = psi.get("client_secret")
+                elif isinstance(psi, stripe.SetupIntent):
+                    client_secret = psi.client_secret
+        except Exception:
+            pass
+
+    if not client_secret:
+        logger.error("Could not extract client_secret from subscription")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to initialize payment. Please try again.",
+        )
+
+    return DonationResponse(
+        clientSecret=client_secret,
+        type="subscription",
     )
 
-# Retrieve invoice using Stripe 2025 structure
-invoice = stripe.Invoice.retrieve(
-    latest_invoice.id
-    if hasattr(latest_invoice, "id")
-    else latest_invoice,
-    expand=[
-        "payments",
-    ],
-)
-
-payments = invoice.get("payments")
-
-if not payments or not payments.data:
-    logger.error(
-        "No payments found on invoice"
-    )
-
-    raise HTTPException(
-        status_code=500,
-        detail="No payments found",
-    )
-
-invoice_payment = payments.data[0]
-
-payment_data = invoice_payment.get(
-    "payment"
-)
-
-if not payment_data:
-    logger.error(
-        "No payment object found"
-    )
-
-    raise HTTPException(
-        status_code=500,
-        detail="No payment object found",
-    )
-
-payment_intent_id = payment_data.get(
-    "payment_intent"
-)
-
-if not payment_intent_id:
-    logger.error(
-        "No payment_intent found"
-    )
-
-    raise HTTPException(
-        status_code=500,
-        detail="No payment intent found",
-    )
-
-payment_intent = stripe.PaymentIntent.retrieve(
-    payment_intent_id
-)
-
-client_secret = payment_intent.client_secret
-
-if not client_secret:
-    logger.error(
-        "No client secret found"
-    )
-
-    raise HTTPException(
-        status_code=500,
-        detail="Client secret missing",
-    )
-
-return DonationResponse(
-    clientSecret=client_secret,
-    type="subscription",
-)
 
 # ─────────────────────────────────────────────────────────────
 # Stripe Webhook
