@@ -286,23 +286,29 @@ async def get_or_create_price(
         f"{interval}"
     )
 
+    # ─────────────────────────────────────────
+    # MEMORY CACHE
+    # ─────────────────────────────────────────
+
     if cache_key in _price_cache:
+
         return _price_cache[
             cache_key
         ]
 
     try:
 
-        prices = stripe.Price.search(
-            query=(
-                f"active:'true' "
-                f"AND currency:'{currency.lower()}' "
-                f"AND unit_amount:{amount}"
-            ),
+        # ─────────────────────────────────────
+        # LIST EXISTING PRICES
+        # ─────────────────────────────────────
+
+        prices = stripe.Price.list(
+            product=product_id,
+            active=True,
             limit=100,
         )
 
-        for price in prices.data:
+        for price in prices.auto_paging_iter():
 
             recurring = getattr(
                 price,
@@ -311,10 +317,15 @@ async def get_or_create_price(
             )
 
             if (
-                recurring
+                price.currency.lower()
+                == currency.lower()
+                and price.unit_amount
+                == amount
+                and recurring
                 and recurring.get(
                     "interval"
-                ) == interval
+                )
+                == interval
             ):
 
                 _price_cache[
@@ -322,10 +333,15 @@ async def get_or_create_price(
                 ] = price.id
 
                 logger.info(
-                    f"Using price: {price.id}"
+                    f"Using existing price: "
+                    f"{price.id}"
                 )
 
                 return price.id
+
+        # ─────────────────────────────────────
+        # CREATE NEW PRICE
+        # ─────────────────────────────────────
 
         price = stripe.Price.create(
             product=product_id,
@@ -344,7 +360,8 @@ async def get_or_create_price(
         ] = price.id
 
         logger.info(
-            f"Created price: {price.id}"
+            f"Created new price: "
+            f"{price.id}"
         )
 
         return price.id
@@ -362,7 +379,6 @@ async def get_or_create_price(
                 or str(exc)
             ),
         )
-
 
 async def create_one_time_payment(
     amount: int,
