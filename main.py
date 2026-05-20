@@ -322,10 +322,11 @@ async def get_or_create_price(
                 and price.unit_amount
                 == amount
                 and recurring
-                and recurring.get(
-                    "interval"
-                )
-                == interval
+                and getattr(
+                    recurring,
+                    "interval",
+                    None,
+                ) == interval
             ):
 
                 _price_cache[
