@@ -15,6 +15,7 @@ Features:
 
 import os
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -412,12 +413,7 @@ async def create_one_time_payment(
                 "donation_type":
                 "one_time",
             },
-            idempotency_key=(
-                f"payment_"
-                f"{customer_id}_"
-                f"{amount}_"
-                f"{currency}"
-            ),
+            idempotency_key=str(uuid.uuid4()),
         )
 
         logger.info(
@@ -476,11 +472,7 @@ async def create_subscription(
                     "donation_type":
                     "recurring",
                 },
-                idempotency_key=(
-                    f"subscription_"
-                    f"{customer_id}_"
-                    f"{price_id}"
-                ),
+                idempotency_key=str(uuid.uuid4()),
             )
         )
 
