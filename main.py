@@ -468,13 +468,9 @@ async def create_subscription(
                     "on_subscription",
                 },
                 expand=[
-                    (
-                        "latest_invoice."
-                        "payment_intent"
-                    ),
-                    (
-                        "pending_setup_intent"
-                    ),
+                    "latest_invoice.confirmation_secret",
+                    "latest_invoice.payment_intent", 
+                    "pending_setup_intent",
                 ],
                 metadata={
                     "donation_type":
@@ -517,101 +513,114 @@ async def extract_client_secret(
     subscription: stripe.Subscription,
 ) -> str:
 
-    latest_invoice = getattr(
-        subscription,
-        "latest_invoice",
-        None,
-    )
-
-    client_secret = None
-
-    # ─────────────────────────────────────────
-    # PAYMENT INTENT
-    # ─────────────────────────────────────────
-
     try:
 
-        if latest_invoice:
-
-            payment_intent = getattr(
-                latest_invoice,
-                "payment_intent",
-                None,
-            )
-
-            if payment_intent:
-
-                if isinstance(
-                    payment_intent,
-                    str,
-                ):
-
-                    payment_intent = (
-                        stripe.PaymentIntent.retrieve(
-                            payment_intent
-                        )
-                    )
-
-                client_secret = getattr(
-                    payment_intent,
-                    "client_secret",
-                    None,
-                )
-
-    except Exception as e:
-
-        logger.error(
-            f"payment_intent "
-            f"error: {e}"
+        latest_invoice = getattr(
+            subscription,
+            "latest_invoice",
+            None,
         )
 
-    # ─────────────────────────────────────────
-    # SETUP INTENT FALLBACK
-    # ─────────────────────────────────────────
+        if not latest_invoice:
 
-    if not client_secret:
+            raise HTTPException(
+                status_code=500,
+                detail="No invoice found",
+            )
 
-        try:
+        # -----------------------------------------------------
+        # NEW STRIPE METHOD
+        # latest_invoice.confirmation_secret.client_secret
+        # -----------------------------------------------------
 
-            setup_intent = getattr(
-                subscription,
-                "pending_setup_intent",
+        confirmation_secret = getattr(
+            latest_invoice,
+            "confirmation_secret",
+            None,
+        )
+
+        if confirmation_secret:
+
+            client_secret = getattr(
+                confirmation_secret,
+                "client_secret",
                 None,
             )
 
-            if setup_intent:
+            if client_secret:
 
-                if isinstance(
-                    setup_intent,
-                    str,
-                ):
+                return client_secret
 
-                    setup_intent = (
-                        stripe.SetupIntent.retrieve(
-                            setup_intent
-                        )
+        # -----------------------------------------------------
+        # FALLBACK TO PAYMENT INTENT
+        # -----------------------------------------------------
+
+        payment_intent = getattr(
+            latest_invoice,
+            "payment_intent",
+            None,
+        )
+
+        if payment_intent:
+
+            if isinstance(
+                payment_intent,
+                str,
+            ):
+
+                payment_intent = (
+                    stripe.PaymentIntent.retrieve(
+                        payment_intent
                     )
-
-                client_secret = getattr(
-                    setup_intent,
-                    "client_secret",
-                    None,
                 )
 
-        except Exception as e:
-
-            logger.error(
-                f"setup_intent "
-                f"error: {e}"
+            client_secret = getattr(
+                payment_intent,
+                "client_secret",
+                None,
             )
 
-    # ─────────────────────────────────────────
+            if client_secret:
 
-    if not client_secret:
+                return client_secret
+
+        # -----------------------------------------------------
+        # FALLBACK TO SETUP INTENT
+        # -----------------------------------------------------
+
+        setup_intent = getattr(
+            subscription,
+            "pending_setup_intent",
+            None,
+        )
+
+        if setup_intent:
+
+            if isinstance(
+                setup_intent,
+                str,
+            ):
+
+                setup_intent = (
+                    stripe.SetupIntent.retrieve(
+                        setup_intent
+                    )
+                )
+
+            client_secret = getattr(
+                setup_intent,
+                "client_secret",
+                None,
+            )
+
+            if client_secret:
+
+                return client_secret
+
+        # -----------------------------------------------------
 
         logger.error(
-            "Failed to extract "
-            "client_secret"
+            "Failed to extract client_secret"
         )
 
         raise HTTPException(
@@ -622,8 +631,16 @@ async def extract_client_secret(
             ),
         )
 
-    return client_secret
+    except Exception as exc:
 
+        logger.exception(
+            f"Client secret extraction error: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Stripe client secret error",
+        )
 # ─────────────────────────────────────────────────────────────
 # WEBHOOK HANDLERS
 # ─────────────────────────────────────────────────────────────
