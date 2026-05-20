@@ -58,14 +58,12 @@ if not STRIPE_SECRET_KEY:
 
 stripe.api_key = STRIPE_SECRET_KEY
 
+# Optional:
+# Remove this line if Stripe rejects the API version
 stripe.api_version = "2025-04-30.basil"
 
-stripe.default_http_client = (
-    stripe.http_client.RequestsClient(
-        timeout=30
-    )
-)
-
+# Retry failed network requests automatically
+stripe.max_network_retries = 2
 # ─────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────
